@@ -203,6 +203,30 @@ FP16, so lowering precision was not an option either.
   388 tokens and every word kept; a forced chunk of 400 IP addresses split into
   8 pieces with every character kept.
 
+### 3.16 Retrieval quality: hybrid search with reranking
+
+- **Problem:** semantic search alone misses exact identifiers (`LTE_CELL_ID`,
+  `GreySpot.jar`, table names), and its similarity score is a weak judge of
+  which excerpt actually answers the question.
+- **Resolution (`retrieval.py`):**
+  1. **Semantic search:** FAISS returns the 50 nearest chunks to the question.
+  2. **Keyword search:** a SQLite FTS5 index with BM25 ranking returns the 50
+     best keyword matches. It lives in `lexical.sqlite3` next to the FAISS
+     index, is built automatically, and only adds new chunks on each query, so
+     it keeps up with an indexing run in progress (first build of 43,726 chunks:
+     2.5 s; later syncs: about 0.02 s).
+  3. **Fusion:** reciprocal rank fusion merges both lists by rank, so the two
+     different score scales never need to be compared.
+  4. **Deduplication:** identical excerpts from repeated document versions are
+     kept once.
+  5. **Reranking:** the top 50 candidates are scored by the cross-encoder
+     `cross-encoder/ms-marco-MiniLM-L6-v2` (22M parameters, ONNX on the CPU),
+     which reads the question and each excerpt together. The 10 best go to the
+     answer model.
+- **Result:** for "what is cell compound" the top excerpts became the cell and
+  cell-group definitions from the KT summary document. A query takes about
+  4–8 seconds for retrieval and reranking on the CPU while indexing runs.
+
 ## 4. Running it today
 
 1. Start the embedding server in its own window and leave it open:

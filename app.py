@@ -2,26 +2,24 @@
 
 from __future__ import annotations
 
-import sqlite3
 import traceback
 from pathlib import Path
 
 import faiss
-import numpy as np
 import streamlit as st
 
-from llm import OllamaError, embed, generate
+from llm import OllamaError, generate
+from retrieval import Match, Reranker, hybrid_search, sync_lexical_index
 
 ROOT = Path(__file__).parent
 INDEX_DIR = ROOT / "data" / "index_arctic33"
 INDEX_FILE = INDEX_DIR / "stov_atoll.faiss"
 METADATA_FILE = INDEX_DIR / "metadata.sqlite3"
+MODEL_DIR = ROOT / "data" / "models"
 OLLAMA_URL = "http://127.0.0.1:11434"
 EMBEDDING_MODEL = "snowflake-arctic-embed:33m"
 ANSWER_MODEL = "llama3.2:3b"
 TOP_K = 10
-# Arctic Embed retrieves well only when queries (not documents) carry this instruction.
-QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 
 st.set_page_config(page_title="STOV-ATOLL Assistant", page_icon="📡", layout="wide")
 st.title("STOV-ATOLL Assistant")
@@ -35,36 +33,25 @@ def load_index() -> faiss.Index | None:
     return faiss.read_index(str(INDEX_FILE))
 
 
-def retrieve(question: str) -> list[tuple[float, dict[str, str]]]:
+@st.cache_resource
+def load_reranker() -> Reranker:
+    return Reranker(MODEL_DIR)
+
+
+def retrieve(question: str) -> list[Match]:
     index = load_index()
-    if index is None or index.ntotal == 0:
+    if index is None:
         return []
-    vector = np.asarray(embed([QUERY_PREFIX + question], EMBEDDING_MODEL, OLLAMA_URL), dtype="float32")
-    faiss.normalize_L2(vector)
-    scores, positions = index.search(vector, min(TOP_K, index.ntotal))
-    matches: list[tuple[float, dict[str, str]]] = []
-    with sqlite3.connect(METADATA_FILE) as connection:
-        for score, position in zip(scores[0], positions[0]):
-            if position < 0:
-                continue
-            row = connection.execute(
-                "SELECT source, location, chunk, text FROM records WHERE id = ?",
-                (int(position),),
-            ).fetchone()
-            if row:
-                matches.append(
-                    (
-                        float(score),
-                        {"source": row[0], "location": row[1], "chunk": row[2], "text": row[3]},
-                    )
-                )
-    return matches
+    lexical_path = sync_lexical_index(INDEX_DIR)
+    return hybrid_search(
+        question, index, INDEX_DIR, lexical_path, load_reranker(), EMBEDDING_MODEL, OLLAMA_URL, TOP_K
+    )
 
 
-def make_prompt(question: str, matches: list[tuple[float, dict[str, str]]]) -> str:
+def make_prompt(question: str, matches: list[Match]) -> str:
     context = "\n\n".join(
-        f"[{number}] {record['source']} ({record['location']}, chunk {record['chunk']})\n{record['text']}"
-        for number, (_, record) in enumerate(matches, start=1)
+        f"[{number}] {match.source} ({match.location}, chunk {match.chunk})\n{match.text}"
+        for number, match in enumerate(matches, start=1)
     )
     return f"""You answer questions about STOV-ATOLL using only the supplied document excerpts.
 If the excerpts do not contain the answer, say that the indexed documents do not provide enough information.
@@ -78,14 +65,14 @@ QUESTION:
 """
 
 
-def show_matches(matches: list[tuple[float, dict[str, str]]]) -> None:
+def show_matches(matches: list[Match]) -> None:
     with st.expander(f"Retrieved excerpts ({len(matches)})"):
-        for number, (score, record) in enumerate(matches, start=1):
+        for number, match in enumerate(matches, start=1):
             st.markdown(
-                f"**[{number}] `{record['source']}`** — {record['location']}, "
-                f"chunk {record['chunk']} (similarity {score:.3f})"
+                f"**[{number}] `{match.source}`** — {match.location}, chunk {match.chunk} "
+                f"(relevance {match.rerank_score:.2f}; found by {' + '.join(match.found_by)} search)"
             )
-            st.text(record["text"])
+            st.text(match.text)
 
 
 if "messages" not in st.session_state:

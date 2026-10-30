@@ -2,5 +2,7 @@
 __pycache__/
 data/source/*
 data/index/*
+data/index_*/
+data/models/
 !data/source/.gitkeep
 !data/index/.gitkeep
