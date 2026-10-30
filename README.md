@@ -79,3 +79,17 @@ The authenticated SharePoint session is available to the development tools, but
 this tenant currently returns malformed XML for its folder/search REST response.
 Download the files from the authenticated browser session and place them in
 `data\source`; ingestion is then fully local and repeatable.
+
+
+### Latest Hybrid Search Mechanism added ###
+
+flowchart LR
+    Q[Question] --> D[dense_search: FAISS top 50]
+    Q --> L[lexical_search: BM25 top 50]
+    D --> F[reciprocal_rank_fusion]
+    L --> F
+    F --> C[Top 50 candidates]
+    C --> T[Fetch text from SQLite, drop duplicates]
+    T --> R[Reranker.score]
+    R --> A[Top 10 to llama3.2:3b]
+
