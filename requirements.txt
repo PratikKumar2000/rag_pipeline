@@ -1,0 +1,8 @@
+streamlit>=1.39,<2
+faiss-cpu>=1.9,<2
+numpy>=1.26,<3
+requests>=2.32,<3
+pypdf>=5,<7
+python-docx>=1.1,<2
+openpyxl>=3.1,<4
+python-pptx>=1.0,<2
