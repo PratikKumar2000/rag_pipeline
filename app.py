@@ -1,49 +1,31 @@
-"""Streamlit UI for local STOV-ATOLL semantic search and Q&A."""
+"""Streamlit UI for local STOV-ATOLL question answering."""
 
 from __future__ import annotations
 
 import sqlite3
+import traceback
 from pathlib import Path
 
 import faiss
 import numpy as np
 import streamlit as st
 
-from ingest import build_index
 from llm import OllamaError, embed, generate
 
 ROOT = Path(__file__).parent
-SOURCE_DIR = ROOT / "data" / "source"
-INDEX_DIR = ROOT / "data" / "index"
+INDEX_DIR = ROOT / "data" / "index_arctic33"
 INDEX_FILE = INDEX_DIR / "stov_atoll.faiss"
 METADATA_FILE = INDEX_DIR / "metadata.sqlite3"
+OLLAMA_URL = "http://127.0.0.1:11434"
+EMBEDDING_MODEL = "snowflake-arctic-embed:33m"
+ANSWER_MODEL = "llama3.2:3b"
+TOP_K = 10
+# Arctic Embed retrieves well only when queries (not documents) carry this instruction.
+QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 
 st.set_page_config(page_title="STOV-ATOLL Assistant", page_icon="📡", layout="wide")
 st.title("STOV-ATOLL Assistant")
-st.caption("Local SharePoint-document retrieval with FAISS and Ollama")
-
-with st.sidebar:
-    st.header("Settings")
-    embedding_model = st.text_input("Embedding model", "all-minilm")
-    generation_model = st.text_input("Answer model", "llama3.2:3b")
-    ollama_url = st.text_input("Ollama URL", "http://127.0.0.1:11434")
-    top_k = st.slider("Retrieved chunks", 1, 10, 5)
-    st.divider()
-    st.write(f"Source folder: `{SOURCE_DIR}`")
-    if st.button("Rebuild FAISS index", type="primary"):
-        with st.spinner("Extracting documents and creating embeddings..."):
-            try:
-                result = build_index(
-                    SOURCE_DIR,
-                    INDEX_DIR,
-                    embedding_model,
-                    ollama_url,
-                )
-                st.cache_resource.clear()
-                st.success(f"Indexed {result['documents']} documents and {result['chunks']} chunks.")
-                st.rerun()
-            except Exception as exc:
-                st.error(str(exc))
+st.caption("Ask a question about STOV-ATOLL. Answers come only from the indexed project documents.")
 
 
 @st.cache_resource
@@ -53,14 +35,13 @@ def load_index() -> faiss.Index | None:
     return faiss.read_index(str(INDEX_FILE))
 
 
-def retrieve(question: str, top_k: int, model: str, base_url: str) -> list[tuple[float, dict[str, str]]]:
-    loaded = load_index()
-    if loaded is None:
+def retrieve(question: str) -> list[tuple[float, dict[str, str]]]:
+    index = load_index()
+    if index is None or index.ntotal == 0:
         return []
-    index = loaded
-    vector = np.asarray(embed([question], model, base_url), dtype="float32")
+    vector = np.asarray(embed([QUERY_PREFIX + question], EMBEDDING_MODEL, OLLAMA_URL), dtype="float32")
     faiss.normalize_L2(vector)
-    scores, positions = index.search(vector, min(top_k, index.ntotal))
+    scores, positions = index.search(vector, min(TOP_K, index.ntotal))
     matches: list[tuple[float, dict[str, str]]] = []
     with sqlite3.connect(METADATA_FILE) as connection:
         for score, position in zip(scores[0], positions[0]):
@@ -74,12 +55,7 @@ def retrieve(question: str, top_k: int, model: str, base_url: str) -> list[tuple
                 matches.append(
                     (
                         float(score),
-                        {
-                            "source": row[0],
-                            "location": row[1],
-                            "chunk": row[2],
-                            "text": row[3],
-                        },
+                        {"source": row[0], "location": row[1], "chunk": row[2], "text": row[3]},
                     )
                 )
     return matches
@@ -102,17 +78,26 @@ QUESTION:
 """
 
 
+def show_matches(matches: list[tuple[float, dict[str, str]]]) -> None:
+    with st.expander(f"Retrieved excerpts ({len(matches)})"):
+        for number, (score, record) in enumerate(matches, start=1):
+            st.markdown(
+                f"**[{number}] `{record['source']}`** — {record['location']}, "
+                f"chunk {record['chunk']} (similarity {score:.3f})"
+            )
+            st.text(record["text"])
+
+
 if "messages" not in st.session_state:
     st.session_state.messages = []
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
+        if message.get("matches"):
+            show_matches(message["matches"])
 
-if not INDEX_FILE.exists():
-    st.info(
-        "Copy SharePoint documents into `data/source`, install Ollama models, then click "
-        "**Rebuild FAISS index**."
-    )
+if load_index() is None:
+    st.info("The document index is not available yet. Please try again once indexing has finished.")
 
 question = st.chat_input("Ask a question about STOV-ATOLL")
 if question:
@@ -121,18 +106,19 @@ if question:
         st.markdown(question)
     with st.chat_message("assistant"):
         try:
-            matches = retrieve(question, top_k, embedding_model, ollama_url)
+            with st.spinner("Searching the documents..."):
+                matches = retrieve(question)
             if not matches:
                 answer = "No indexed documents are available yet."
             else:
-                answer = generate(make_prompt(question, matches), generation_model, ollama_url)
-                answer += "\n\n**Sources**\n" + "\n".join(
-                    f"- `{record['source']}` — {record['location']} (similarity {score:.3f})"
-                    for score, record in matches
-                )
+                with st.spinner("Writing the answer..."):
+                    answer = generate(make_prompt(question, matches), ANSWER_MODEL, OLLAMA_URL)
             st.markdown(answer)
-            st.session_state.messages.append({"role": "assistant", "content": answer})
-        except OllamaError as exc:
-            st.error(str(exc))
+            if matches:
+                show_matches(matches)
+            st.session_state.messages.append({"role": "assistant", "content": answer, "matches": matches})
+        except OllamaError:
+            st.error("The assistant is not available right now. Please check that Ollama is running.")
         except Exception as exc:
-            st.error(f"Query failed: {exc}")
+            traceback.print_exc()
+            st.error(f"Query failed ({type(exc).__name__}): {exc}")

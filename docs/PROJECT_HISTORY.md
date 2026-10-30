@@ -242,9 +242,6 @@ FP16, so lowering precision was not an option either.
 
 ## 6. Open items
 
-- `app.py` still defaults to the old index folder and `all-minilm`. It must point
-  at `data/index_arctic33`, use `snowflake-arctic-embed:33m`, and prefix each
-  query with `Represent this sentence for searching relevant passages: `.
 - Many bundles are repeated versions of the same documents; skipping files with
   identical content would shorten indexing considerably.
 - `.doc`, `.xls` and `.rtf` files are not read; `.ppt` needs LibreOffice.
