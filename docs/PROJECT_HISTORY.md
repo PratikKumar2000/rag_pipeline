@@ -25,16 +25,20 @@ flowchart LR
     CH --> SPLIT[token check and lossless split]
     SPLIT --> EMB[llama-server, 8 slots, snowflake-arctic-embed:33m]
     EMB --> IDX[(FAISS + SQLite metadata)]
-    IDX --> APP[Streamlit app.py]
-    APP -->|answer| LLM[Ollama llama3.2:3b]
+    IDX --> RET[retrieval.py: rewrites, hybrid search, rerank, release history]
+    RET --> APP[Streamlit app.py]
+    APP -->|draft and self-review, max 5 calls| LLM[Ollama llama3.2:3b]
+    LLM -->|run_sql, read-only| IDX
 ```
 
 | Component | File | Role |
 |---|---|---|
 | Staging | `stage_documents.py` | Builds a curated copy: every non-ZIP file plus ZIP contents, excluding `Package`, `Artifacts` and `lib.zip` |
 | Ingestion | `ingest.py` | Discovers files and nested ZIPs, extracts text, chunks, embeds, writes FAISS and SQLite, resumes after failures |
-| Embedding client | `llm.py` | Talks to Ollama (`/api/embed`, `/api/generate`) or llama-server (`/v1/embeddings`, `/tokenize`) |
+| Model client | `llm.py` | Talks to Ollama (`/api/embed`, `/api/generate`, `/api/chat` with tools) or llama-server (`/v1/embeddings`, `/tokenize`) |
 | Embedding server | `start_embed_server.ps1` | Starts Ollama's bundled `llama-server.exe` with several parallel slots on the GPU |
+| Retrieval | `retrieval.py` | Query rewriting, hybrid search, fusion, reranking and the release catalog |
+| Self-review | `reflection.py` | Draft-review loop and the read-only `run_sql` tool |
 | Application | `app.py` | Streamlit question-and-answer UI over the index |
 
 ## 3. Blockers and how each was resolved
@@ -249,6 +253,71 @@ FP16, so lowering precision was not an option either.
 - **Cost:** query rewriting adds about 8–13 s per question on this laptop while
   indexing shares the GPU.
 
+### 3.18 "Latest version" questions could not be answered
+
+- **Symptom:** "what is the latest version of stov" got "the indexed documents
+  do not provide enough information", although the 9105RC2 release documents
+  are indexed.
+- **Cause:** similarity search ranks by meaning, not by recency. The question
+  matched old installation manuals mentioning 7.5, 9.3.2 and 9.4.3, and no
+  single excerpt states which release is newest.
+- **Resolution (`release_catalog` in `retrieval.py`):** release folder and file
+  names such as `STOV9105RC2_Rel_OSS26.10` are parsed from the indexed sources.
+  Four digits not starting with 0 decode as `9105` to 9.10.5; otherwise the last
+  three digits are used (`0999` to 9.9.9, `932` to 9.3.2). Releases are sorted
+  by version and RC, newest first, and cached until new chunks are indexed
+  (0.45 s to build from 124 release names). When the question mentions
+  versions, releases, builds or "latest", the 10 newest go into the prompt as
+  "RELEASE HISTORY [R]".
+- **Result:** "The latest version of STOV is 9.10.5 RC2 [R]."
+- **Limitation:** only folders or files named `STOV<digits>RC<n>` are recognised.
+
+### 3.19 Self-review loop with a read-only SQL tool
+
+- **Goal:** let the model check its own answer and look up missing facts,
+  without human intervention and without being able to change any data.
+- **Resolution (`reflection.py`):**
+  1. The model drafts an answer from the excerpts.
+  2. The draft is sent back with a review prompt. The model may call `run_sql`
+     on the `records` table (cited as [DB]), reply with an improved answer that
+     is reviewed again, or reply `FINAL:` to finish.
+  3. At most 5 model calls per question; on the last one any further lookup is
+     ignored and the previous answer is kept.
+  4. The tool opens the database read-only (`mode=ro`), an SQLite authorizer
+     denies everything except reads, only one statement may run, each query
+     stops after 5 seconds and returns at most 10 rows capped at 3,000
+     characters. `DELETE`, `UPDATE`, `DROP`, `ATTACH`, `PRAGMA` and
+     `SELECT 1; DELETE ...` were all rejected in testing.
+  5. The steps (draft, SQL queries and results, revisions) are shown in the app.
+- **Problem found:** in the first run the model ignored the schema in the tool
+  description and queried a non-existent `version` column twice (167 s).
+  Repeating the table and columns in the review prompt fixed it: the model
+  searched `LIKE '%9.10.5%'`, found the release notes and the 9105RC2
+  deployment manual, and finished in 56 s.
+- **Context window:** Ollama ran `llama3.2:3b` with 4,096 tokens, which the
+  loop would overflow (Ollama then silently drops the start of the prompt).
+  Every answer-model call now uses `num_ctx` 8,192, about 0.9 GB of KV cache.
+  The model's 131,072-token maximum would need about 14.7 GB and does not fit.
+
+### 3.20 The answer was a raw `run_sql` JSON
+
+- **Symptom:** "what is the long form of stov" was answered with
+  `{"name":"run_sql","parameters":{"query":"SELECT ... LIKE '%STOV%' LIMIT 5"}}`.
+- **Cause:** on the last round the tool was not declared, so Ollama did not
+  parse tool calls; the 3B model wrote one anyway in Llama 3.2's text format,
+  and the loop accepted any text without `FINAL:` as a revised answer. In a
+  later test the model also wrote malformed JSON (`query":"SELECT ...`), which
+  no JSON parser accepts.
+- **Resolution:**
+  - the tool stays declared on every round, so Ollama parses calls itself;
+  - text that mentions `run_sql` is treated as a call: parsed as JSON, or, if
+    malformed, the `SELECT` statement is extracted from it;
+  - such text can never become the answer, and a call on the last round
+    stops the loop with the previous answer kept;
+  - a repeated query returns "already run" instead of executing again.
+- **Result:** both test questions returned proper answers ("StandOrtVerwaltung"
+  and 9.10.5 RC2) in 42 s and 62 s.
+
 ## 4. Running it today
 
 1. Start the embedding server in its own window and leave it open:
@@ -285,6 +354,13 @@ FP16, so lowering precision was not an option either.
   file replacement and cleanup to retry or avoid deletion.
 - Make long jobs resumable from the start, with a settings hash so a resumed
   run can never mix incompatible chunks.
+- Similarity search cannot answer "latest", "how many" or other questions over
+  the whole collection; those need structured data such as the release catalog.
+- Small models follow tool formats loosely. Validate every model output before
+  showing it, and enforce safety in the database (read-only mode, authorizer),
+  not in the prompt.
+- A model's maximum context is not its running context; size `num_ctx` for the
+  largest real prompt, because the KV cache is reserved up front.
 
 ## 6. Open items
 
@@ -293,6 +369,9 @@ FP16, so lowering precision was not an option either.
 - `.doc`, `.xls` and `.rtf` files are not read; `.ppt` needs LibreOffice.
 - When embedding through Ollama instead of llama-server, token counts cannot be
   checked, so the character cap is the only protection against truncation.
+- The 3B model rarely replies `FINAL:` and usually keeps searching until the
+  5-call limit, so self-review adds 30–90 s; a larger answer model or fewer
+  rounds would shorten it.
 - `C:\rag_docs\Knowledge Repository` and `C:\rag_docs\STOV - ST Delivery` could
   not be deleted because of file locks; they are harmless while `--source`
   points at `curated`.

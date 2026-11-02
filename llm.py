@@ -7,6 +7,8 @@ from typing import Any
 
 import requests
 
+# Every generation call uses the same window so Ollama never reloads the model between calls.
+CONTEXT_TOKENS = 8192
 
 class OllamaError(RuntimeError):
     """Raised when Ollama cannot complete a request."""
@@ -97,7 +99,7 @@ def generate(
     max_tokens: int | None = None,
 ) -> str:
     """Generate a response without streaming; json_output constrains it to valid JSON."""
-    options: dict[str, Any] = {"temperature": temperature}
+    options: dict[str, Any] = {"temperature": temperature, "num_ctx": CONTEXT_TOKENS}
     if max_tokens:
         options["num_predict"] = max_tokens
     payload: dict[str, Any] = {
@@ -114,3 +116,26 @@ def generate(
     if not answer:
         raise OllamaError("Ollama returned an empty answer.")
     return answer
+
+
+def chat(
+    messages: list[dict[str, Any]],
+    model: str,
+    base_url: str = "http://127.0.0.1:11434",
+    tools: list[dict[str, Any]] | None = None,
+    temperature: float = 0.1,
+) -> dict[str, Any]:
+    """Send a chat turn and return the assistant message, which may contain tool calls."""
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "keep_alive": -1,
+        "options": {"temperature": temperature, "num_ctx": CONTEXT_TOKENS},
+    }
+    if tools:
+        payload["tools"] = tools
+    message = _post(base_url, "/api/chat", payload, timeout=300).get("message") or {}
+    if not message.get("content", "").strip() and not message.get("tool_calls"):
+        raise OllamaError("Ollama returned an empty answer.")
+    return message

@@ -7,6 +7,7 @@ import os
 import re
 import sqlite3
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 
 import faiss
@@ -30,6 +31,11 @@ RERANKER_REPO = "cross-encoder/ms-marco-MiniLM-L6-v2"
 RERANKER_MAX_TOKENS = 512
 # Arctic Embed retrieves well only when queries (not documents) carry this instruction.
 QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
+RELEASE_LIMIT = 10
+RELEASE_NAME = re.compile(r"(?i)^STOV(\d{3,4})RC(\d+)(?:_(.+?))?(?:\.\w{3,4})?$")
+RELEASE_QUESTION = re.compile(
+    r"(?i)\b(version|versions|release|releases|latest|newest|current|recent|build|rc\d*|hotfix|patch|deploy\w*)\b"
+)
 STOPWORDS = set(
     "a an and are as at be by can do does for from how i in is it of on or that the this to "
     "was what when where which who why will with you your me my we our there their".split()
@@ -74,6 +80,71 @@ class Reranker:
             logits = self.session.run(None, {k: v for k, v in inputs.items() if k in self.input_names})[0]
             scores.extend(float(value) for value in logits[:, 0])
         return scores
+
+
+@dataclass
+class Release:
+    version: tuple[int, int, int]
+    candidate: int
+    names: list[str]
+    folder: str
+
+    @property
+    def label(self) -> str:
+        return f"{'.'.join(map(str, self.version))} RC{self.candidate}"
+
+
+def _parse_version(digits: str) -> tuple[int, int, int]:
+    # Folder names drop the dots: 932 and 0932 are 9.3.2, 0999 is 9.9.9, 9105 is 9.10.5.
+    if len(digits) == 4 and digits[0] != "0":
+        return int(digits[0]), int(digits[1:3]), int(digits[3])
+    digits = digits[-3:]
+    return int(digits[0]), int(digits[1]), int(digits[2])
+
+
+def is_release_question(question: str) -> bool:
+    return bool(RELEASE_QUESTION.search(question))
+
+
+def release_catalog(index_dir: Path) -> list[Release]:
+    """All STOV releases named in the indexed folder and file names, newest first."""
+    with sqlite3.connect(f"file:{index_dir / 'metadata.sqlite3'}?mode=ro", uri=True) as metadata:
+        last_id = metadata.execute("SELECT MAX(id) FROM records").fetchone()[0]
+    return _release_catalog(str(index_dir), last_id)
+
+
+@lru_cache(maxsize=4)
+def _release_catalog(index_dir: str, last_id: int | None) -> list[Release]:
+    releases: dict[tuple[tuple[int, int, int], int], Release] = {}
+    with sqlite3.connect(f"file:{Path(index_dir) / 'metadata.sqlite3'}?mode=ro", uri=True) as metadata:
+        sources = [row[0] for row in metadata.execute("SELECT DISTINCT source FROM records")]
+    for source in sources:
+        parts = re.split(r"[\\/]", source)
+        for position, part in enumerate(parts):
+            found = RELEASE_NAME.match(part.strip())
+            if not found:
+                continue
+            key = (_parse_version(found.group(1)), int(found.group(2)))
+            name = re.sub(r"\.\w{3,4}$", "", part.strip())
+            release = releases.setdefault(key, Release(*key, names=[], folder="\\".join(parts[: position + 1])))
+            if name not in release.names:
+                release.names.append(name)
+            break
+    return sorted(releases.values(), key=lambda r: (r.version, r.candidate), reverse=True)
+
+
+def release_overview(index_dir: Path, limit: int = RELEASE_LIMIT) -> str:
+    releases = release_catalog(index_dir)[:limit]
+    if not releases:
+        return ""
+    lines = [
+        f"- STOV {release.label}: {', '.join(sorted(release.names)[:3])} (folder {release.folder})"
+        for release in releases
+    ]
+    return (
+        "STOV releases found in the document library, ordered newest first by version and release "
+        "candidate (RC). The first entry is the latest release.\n" + "\n".join(lines)
+    )
 
 
 def _index_version(index_dir: Path) -> str:

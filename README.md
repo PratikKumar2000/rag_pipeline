@@ -30,9 +30,22 @@ while building it and why each design choice was made.
    excerpts from repeated document versions are removed.
 4. **Reranking:** the cross-encoder `ms-marco-MiniLM-L6-v2` scores the best 50
    candidates against the original question, on the CPU.
-5. **Answer:** the 10 best excerpts go to `llama3.2:3b`, which answers only from
-   them and cites excerpt numbers. The app shows the queries searched and the
-   excerpts used.
+5. **Release history:** when the question mentions versions, releases, builds
+   or "latest", the 10 newest releases are added, sorted by the version in the
+   release folder names (`STOV9105RC2_...` is 9.10.5 RC2). Similarity search
+   cannot tell which release is newest, so this list answers "latest" questions.
+6. **Answer:** the 10 best excerpts go to `llama3.2:3b`, which drafts an answer
+   from them and cites excerpt numbers.
+7. **Self-review:** the model reviews its own draft. It can call a `run_sql`
+   tool to search the chunk database (cited as [DB]), and stops when it marks
+   the answer `FINAL:`, or after 5 model calls at most. The tool is read-only:
+   the database opens in read-only mode, an SQLite authorizer allows only
+   reads, each query is limited to 5 seconds and 10 rows, and a repeated query
+   is answered from the earlier result instead of running again. A tool call
+   that the model writes as plain text, even malformed JSON, is run as a call
+   and never shown as the answer; a call on the last round is ignored and the
+   previous answer kept. The app shows the queries searched, the review steps
+   and the excerpts used.
 
 ## Files
 
@@ -42,6 +55,7 @@ while building it and why each design choice was made.
 | `ingest.py` | Extracts, chunks, embeds and indexes documents; resumable |
 | `start_embed_server.ps1` | Starts Ollama's bundled llama-server with parallel slots for fast embedding |
 | `retrieval.py` | Query rewriting, hybrid search, fusion and reranking |
+| `reflection.py` | Self-review loop and the read-only SQL tool |
 | `llm.py` | Client for Ollama and llama-server |
 | `app.py` | Streamlit question-and-answer UI |
 
@@ -136,12 +150,44 @@ Settings are constants, not UI options:
 | Query rewrites (`QUERY_VARIANTS`) | `retrieval.py` | 5 |
 | Semantic and keyword results per query (`DENSE_K`, `LEXICAL_K`) | `retrieval.py` | 50 each |
 | Candidates reranked (`RERANK_K`) | `retrieval.py` | 50 |
+| Model calls per answer, rows and seconds per SQL query (`MAX_ROUNDS`, `MAX_ROWS`, `QUERY_SECONDS`) | `reflection.py` | 5, 10, 5 |
+| Context window for every answer-model call (`CONTEXT_TOKENS`) | `llm.py` | 8,192 |
 
 On this laptop a question takes roughly 10 s for rewriting, 5–6 s for search
-and reranking, and 25–80 s for the answer while indexing shares the GPU.
-Lowering `RERANK_K` or `TOP_K` makes answers faster.
+and reranking, and 40–110 s for drafting and self-review. Lowering
+`MAX_ROUNDS`, `RERANK_K` or `TOP_K` makes answers faster.
 
-<<<<<<< HEAD
+### Context window and memory
+
+`llama3.2:3b` supports 131,072 tokens, but Ollama runs it with 4,096 unless a
+request sets `num_ctx`. One self-review conversation holds at most about
+7,000 tokens (excerpts and instructions about 3,500, up to three SQL results
+of about 750 each, plus drafts), so every call uses 8,192. All calls use the
+same value so Ollama never reloads the model between them.
+
+Ollama reserves the KV cache for the whole window up front, about 112 KB per
+token for this model:
+
+| `num_ctx` | KV cache | With the 2 GB of weights |
+|---|---|---|
+| 4,096 | 0.45 GB | 2.5 GB |
+| 8,192 | 0.9 GB | 2.9 GB |
+| 16,384 | 1.8 GB | 3.8 GB |
+| 131,072 | 14.7 GB | about 17 GB, too large for this laptop |
+
+- `num_ctx` is the window of one conversation: prompt plus generated text.
+- `num_batch` (default 512) is how many prompt tokens are processed per step
+  for that same conversation. All steps write into the same KV cache, so it
+  does not multiply memory; it only sizes a temporary compute buffer.
+- Parallel slots (`OLLAMA_NUM_PARALLEL`, or `-np` for llama-server) do
+  multiply it: each slot has its own KV cache, while the weights are shared.
+  llama-server splits `-c` across slots, so the embedding server's
+  `-c 4096 -np 8` gives each slot 512 tokens.
+
+Size a slot as longest prompt plus longest output; total KV memory is about
+slot size × slots × KV bytes per token. Setting `OLLAMA_FLASH_ATTENTION=1` and
+`OLLAMA_KV_CACHE_TYPE=q8_0` roughly halves the cache if more room is needed.
+
 ## Troubleshooting
 
 | Symptom | Cause and fix |
@@ -151,23 +197,11 @@ Lowering `RERANK_K` or `TOP_K` makes answers faster.
 | `exceed_context_size_error` from llama-server | A chunk is over 512 tokens; only happens when the token check is bypassed. Rerun with `--embed-api openai`. |
 | `Access is denied` while saving the index | A scanner briefly locked the file; the indexer retries automatically. If it still fails, rerun and it resumes. |
 | Two `python.exe` processes per run | Normal: the venv launcher starts the real interpreter as a child. |
-=======
+| Answer is raw JSON such as `{"name":"run_sql",...}` | The 3B model wrote a tool call as text. `reflection.py` now runs such calls and never uses them as the answer; restart Streamlit if it still appears. |
+| Self-review steps show `SQL error: no such column` | The model guessed a column; the error goes back to it and it usually corrects the query in the next round. |
+
 The authenticated SharePoint session is available to the development tools, but
 this tenant currently returns malformed XML for its folder/search REST response.
 Download the files from the authenticated browser session and place them in
 `data\source`; ingestion is then fully local and repeatable.
 
-
-### Latest Hybrid Search Mechanism added ###
-
-flowchart LR
-    Q[Question] --> D[dense_search: FAISS top 50]
-    Q --> L[lexical_search: BM25 top 50]
-    D --> F[reciprocal_rank_fusion]
-    L --> F
-    F --> C[Top 50 candidates]
-    C --> T[Fetch text from SQLite, drop duplicates]
-    T --> R[Reranker.score]
-    R --> A[Top 10 to llama3.2:3b]
-
->>>>>>> a9954b54b9967cf62ed11db712dd337485002bed
