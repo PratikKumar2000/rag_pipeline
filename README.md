@@ -141,6 +141,7 @@ On this laptop a question takes roughly 10 s for rewriting, 5–6 s for search
 and reranking, and 25–80 s for the answer while indexing shares the GPU.
 Lowering `RERANK_K` or `TOP_K` makes answers faster.
 
+<<<<<<< HEAD
 ## Troubleshooting
 
 | Symptom | Cause and fix |
@@ -150,3 +151,23 @@ Lowering `RERANK_K` or `TOP_K` makes answers faster.
 | `exceed_context_size_error` from llama-server | A chunk is over 512 tokens; only happens when the token check is bypassed. Rerun with `--embed-api openai`. |
 | `Access is denied` while saving the index | A scanner briefly locked the file; the indexer retries automatically. If it still fails, rerun and it resumes. |
 | Two `python.exe` processes per run | Normal: the venv launcher starts the real interpreter as a child. |
+=======
+The authenticated SharePoint session is available to the development tools, but
+this tenant currently returns malformed XML for its folder/search REST response.
+Download the files from the authenticated browser session and place them in
+`data\source`; ingestion is then fully local and repeatable.
+
+
+### Latest Hybrid Search Mechanism added ###
+
+flowchart LR
+    Q[Question] --> D[dense_search: FAISS top 50]
+    Q --> L[lexical_search: BM25 top 50]
+    D --> F[reciprocal_rank_fusion]
+    L --> F
+    F --> C[Top 50 candidates]
+    C --> T[Fetch text from SQLite, drop duplicates]
+    T --> R[Reranker.score]
+    R --> A[Top 10 to llama3.2:3b]
+
+>>>>>>> a9954b54b9967cf62ed11db712dd337485002bed
