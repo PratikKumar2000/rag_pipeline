@@ -9,7 +9,7 @@ import faiss
 import streamlit as st
 
 from llm import OllamaError, generate
-from retrieval import Match, Reranker, hybrid_search, sync_lexical_index
+from retrieval import Match, Reranker, hybrid_search, rewrite_queries, sync_lexical_index
 
 ROOT = Path(__file__).parent
 INDEX_DIR = ROOT / "data" / "index_arctic33"
@@ -38,13 +38,13 @@ def load_reranker() -> Reranker:
     return Reranker(MODEL_DIR)
 
 
-def retrieve(question: str) -> list[Match]:
+def retrieve(question: str, queries: list[str]) -> list[Match]:
     index = load_index()
     if index is None:
         return []
     lexical_path = sync_lexical_index(INDEX_DIR)
     return hybrid_search(
-        question, index, INDEX_DIR, lexical_path, load_reranker(), EMBEDDING_MODEL, OLLAMA_URL, TOP_K
+        question, queries, index, INDEX_DIR, lexical_path, load_reranker(), EMBEDDING_MODEL, OLLAMA_URL, TOP_K
     )
 
 
@@ -65,6 +65,11 @@ QUESTION:
 """
 
 
+def show_queries(queries: list[str]) -> None:
+    with st.expander(f"Searched with {len(queries)} queries"):
+        st.markdown("\n".join(f"- {query}" for query in queries))
+
+
 def show_matches(matches: list[Match]) -> None:
     with st.expander(f"Retrieved excerpts ({len(matches)})"):
         for number, match in enumerate(matches, start=1):
@@ -80,6 +85,8 @@ if "messages" not in st.session_state:
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
+        if message.get("queries"):
+            show_queries(message["queries"])
         if message.get("matches"):
             show_matches(message["matches"])
 
@@ -93,17 +100,22 @@ if question:
         st.markdown(question)
     with st.chat_message("assistant"):
         try:
+            with st.spinner("Understanding the question..."):
+                queries = [question] + rewrite_queries(question, ANSWER_MODEL, OLLAMA_URL)
             with st.spinner("Searching the documents..."):
-                matches = retrieve(question)
+                matches = retrieve(question, queries)
             if not matches:
                 answer = "No indexed documents are available yet."
             else:
                 with st.spinner("Writing the answer..."):
                     answer = generate(make_prompt(question, matches), ANSWER_MODEL, OLLAMA_URL)
             st.markdown(answer)
+            show_queries(queries)
             if matches:
                 show_matches(matches)
-            st.session_state.messages.append({"role": "assistant", "content": answer, "matches": matches})
+            st.session_state.messages.append(
+                {"role": "assistant", "content": answer, "queries": queries, "matches": matches}
+            )
         except OllamaError:
             st.error("The assistant is not available right now. Please check that Ollama is running.")
         except Exception as exc:

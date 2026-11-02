@@ -227,6 +227,28 @@ FP16, so lowering precision was not an option either.
   cell-group definitions from the KT summary document. A query takes about
   4–8 seconds for retrieval and reranking on the CPU while indexing runs.
 
+### 3.17 Too many "not enough information" answers: query transformation
+
+- **Problem:** users type short, informal questions ("what is cell compound"),
+  while the documents use formal, varied wording. A single query often missed
+  the passages that held the answer.
+- **Resolution (multi-query retrieval):**
+  1. `llama3.2:3b` rewrites the question into 5 search queries (JSON output,
+     capped at 250 tokens): a clear rephrasing, a keyword version, one with
+     abbreviations expanded and synonyms, a sentence the answering passage might
+     contain, and a broader variant. A worked example in the prompt was needed;
+     without it the 3B model produced only near-identical keyword variants.
+  2. The original question plus the 5 rewrites each run semantic and keyword
+     search: 12 ranked lists. All query embeddings go in one request and one
+     batched FAISS search.
+  3. Reciprocal rank fusion merges all 12 lists, so chunks found by several
+     queries rise to the top; the best 50 are deduplicated.
+  4. The cross-encoder reranks them against the user's original question, and
+     the best 10 go to the answer model.
+  5. If rewriting fails, the search continues with the original question only.
+- **Cost:** query rewriting adds about 8–13 s per question on this laptop while
+  indexing shares the GPU.
+
 ## 4. Running it today
 
 1. Start the embedding server in its own window and leave it open:

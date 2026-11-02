@@ -92,20 +92,24 @@ def generate(
     prompt: str,
     model: str,
     base_url: str = "http://127.0.0.1:11434",
+    temperature: float = 0.1,
+    json_output: bool = False,
+    max_tokens: int | None = None,
 ) -> str:
-    """Generate a grounded answer without enabling streaming."""
-    result = _post(
-        base_url,
-        "/api/generate",
-        {
-            "model": model,
-            "prompt": prompt,
-            "stream": False,
-            "keep_alive": -1,
-            "options": {"temperature": 0.1},
-        },
-        timeout=300,
-    )
+    """Generate a response without streaming; json_output constrains it to valid JSON."""
+    options: dict[str, Any] = {"temperature": temperature}
+    if max_tokens:
+        options["num_predict"] = max_tokens
+    payload: dict[str, Any] = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "keep_alive": -1,
+        "options": options,
+    }
+    if json_output:
+        payload["format"] = "json"
+    result = _post(base_url, "/api/generate", payload, timeout=300)
     answer = result.get("response", "").strip()
     if not answer:
         raise OllamaError("Ollama returned an empty answer.")

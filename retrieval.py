@@ -18,8 +18,9 @@ os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 from huggingface_hub import hf_hub_download
 from tokenizers import Tokenizer
 
-from llm import embed
+from llm import OllamaError, embed, generate
 
+QUERY_VARIANTS = 5
 DENSE_K = 50
 LEXICAL_K = 50
 RRF_K = 60
@@ -138,30 +139,90 @@ def lexical_search(lexical_path: Path, question: str, k: int = LEXICAL_K) -> lis
     return [row[0] for row in rows]
 
 
-def dense_search(
-    index: faiss.Index, question: str, model: str, base_url: str, k: int = DENSE_K
-) -> list[int]:
-    if index.ntotal == 0:
+REWRITE_PROMPT = """You write search queries for a search engine over the STOV-ATOLL project documents.
+STOV is Vodafone's site and technical-object inventory; ATOLL is the radio network planning tool.
+The documents are interface design documents (IDD), architecture documents (SAD), knowledge-transfer
+notes, release notes, test documents, CSV data files and source-code listings about cells, sites,
+sectors, importers, interfaces and database tables.
+
+Write {count} different search queries that would find the passages answering the user's question:
+1. the question rephrased clearly and completely;
+2. only the key technical terms and likely identifiers, as keywords;
+3. the question with abbreviations expanded and synonyms added;
+4. a sentence that a document passage containing the answer would plausibly contain;
+5. a broader variant that covers the surrounding topic.
+Keep the user's technical terms, names and identifiers exactly as written. Do not answer the question.
+Each query must be different in wording, not just a reordering of the same words.
+
+Example
+User question: what is TAC in greyspot
+Output: {{"queries": [
+  "What does the TAC field mean in the GreySpot importer?",
+  "GreySpot TAC Tracking Area Code column",
+  "TAC Tracking Area Code LTE cell attribute imported by GreySpot into STOV",
+  "The TAC column of the GreySpot input file contains the tracking area code of the cell",
+  "GreySpot importer input file format and LTE cell attributes"
+]}}
+
+Return JSON only, with exactly {count} queries.
+
+User question: {question}
+Output:"""
+
+
+def rewrite_queries(question: str, model: str, base_url: str, count: int = QUERY_VARIANTS) -> list[str]:
+    """Ask the LLM for alternative search queries; fall back to none if it fails."""
+    try:
+        response = generate(
+            REWRITE_PROMPT.format(count=count, question=question),
+            model,
+            base_url,
+            temperature=0.3,
+            json_output=True,
+            max_tokens=250,
+        )
+        queries = json.loads(response).get("queries", [])
+    except (OllamaError, ValueError, AttributeError):
         return []
-    vector = np.asarray(embed([QUERY_PREFIX + question], model, base_url), dtype="float32")
-    faiss.normalize_L2(vector)
-    _, positions = index.search(vector, min(k, index.ntotal))
-    return [int(position) for position in positions[0] if position >= 0]
+    seen = {question.strip().lower()}
+    rewrites = []
+    for query in queries:
+        if isinstance(query, str) and query.strip() and query.strip().lower() not in seen:
+            seen.add(query.strip().lower())
+            rewrites.append(query.strip())
+    return rewrites[:count]
 
 
-def reciprocal_rank_fusion(rankings: dict[str, list[int]], k: int = RRF_K) -> list[tuple[int, list[str]]]:
+def dense_search(
+    index: faiss.Index, queries: list[str], model: str, base_url: str, k: int = DENSE_K
+) -> list[list[int]]:
+    """Search FAISS for every query in one embedding call and one batched search."""
+    if index.ntotal == 0:
+        return [[] for _ in queries]
+    vectors = np.asarray(embed([QUERY_PREFIX + query for query in queries], model, base_url), dtype="float32")
+    faiss.normalize_L2(vectors)
+    _, positions = index.search(vectors, min(k, index.ntotal))
+    return [[int(position) for position in row if position >= 0] for row in positions]
+
+
+def reciprocal_rank_fusion(
+    rankings: list[tuple[str, list[int]]], k: int = RRF_K
+) -> list[tuple[int, list[str]]]:
     scores: dict[int, float] = {}
     found_by: dict[int, list[str]] = {}
-    for name, ids in rankings.items():
+    for name, ids in rankings:
         for rank, chunk_id in enumerate(ids, start=1):
             scores[chunk_id] = scores.get(chunk_id, 0.0) + 1.0 / (k + rank)
-            found_by.setdefault(chunk_id, []).append(name)
+            names = found_by.setdefault(chunk_id, [])
+            if name not in names:
+                names.append(name)
     ordered = sorted(scores, key=scores.get, reverse=True)
     return [(chunk_id, found_by[chunk_id]) for chunk_id in ordered]
 
 
 def hybrid_search(
     question: str,
+    queries: list[str],
     index: faiss.Index,
     index_dir: Path,
     lexical_path: Path,
@@ -170,10 +231,9 @@ def hybrid_search(
     base_url: str,
     final_k: int = FINAL_K,
 ) -> list[Match]:
-    rankings = {
-        "semantic": dense_search(index, question, model, base_url),
-        "keyword": lexical_search(lexical_path, question),
-    }
+    """Run semantic and keyword search for every query, fuse all lists, then rerank against the question."""
+    rankings = [("semantic", ids) for ids in dense_search(index, queries, model, base_url)]
+    rankings += [("keyword", lexical_search(lexical_path, query)) for query in queries]
     candidates = reciprocal_rank_fusion(rankings)[:RERANK_K]
     if not candidates:
         return []
