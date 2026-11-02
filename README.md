@@ -197,11 +197,17 @@ slot size × slots × KV bytes per token. Setting `OLLAMA_FLASH_ATTENTION=1` and
 | `exceed_context_size_error` from llama-server | A chunk is over 512 tokens; only happens when the token check is bypassed. Rerun with `--embed-api openai`. |
 | `Access is denied` while saving the index | A scanner briefly locked the file; the indexer retries automatically. If it still fails, rerun and it resumes. |
 | Two `python.exe` processes per run | Normal: the venv launcher starts the real interpreter as a child. |
+<<<<<<< HEAD
 | Answer is raw JSON such as `{"name":"run_sql",...}` | The 3B model wrote a tool call as text. `reflection.py` now runs such calls and never uses them as the answer; restart Streamlit if it still appears. |
 | Self-review steps show `SQL error: no such column` | The model guessed a column; the error goes back to it and it usually corrects the query in the next round. |
+=======
+>>>>>>> c3d67d5241a03d3dc05fde7c4427a77fb8ff926e
 
 The authenticated SharePoint session is available to the development tools, but
 this tenant currently returns malformed XML for its folder/search REST response.
 Download the files from the authenticated browser session and place them in
 `data\source`; ingestion is then fully local and repeatable.
+<<<<<<< HEAD
 
+=======
+>>>>>>> c3d67d5241a03d3dc05fde7c4427a77fb8ff926e
